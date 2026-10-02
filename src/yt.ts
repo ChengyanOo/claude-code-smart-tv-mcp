@@ -6,11 +6,13 @@ import { readFileSync, existsSync, statSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { DATA_DIR, load as loadProfile } from './profile.js';
+import { DATA_DIR, load as loadProfile, type Profile } from './profile.js';
 
 export interface Item {
   id: string; title: string; channel?: string; channelId?: string;
   views?: string; published?: string; duration?: string; live?: boolean; url: string;
+  /** signals behind the pick, see tag(): subscribed, favorite_channel, liked_channel:N, disliked_channel:N, history:N, watched, interest:<topic>, new_channel */
+  why?: string[];
 }
 
 const LANG = process.env.YT_LANG ?? 'en';
@@ -74,13 +76,13 @@ export function anon(): Promise<Innertube> {
 /** Prefer the signed-in session for non-personal lookups too (better results); fall back to anon if auth fails. */
 const any = () => (cookie() ? auth().catch(anon) : anon());
 
-// ---- 5-minute memo cache ----------------------------------------------------
+// ---- 5-minute memo cache (dedupes in-flight calls too) --------------------------
 const TTL = 5 * 60_000;
-const memo = new Map<string, { t: number; v: unknown }>();
-async function cached<T>(key: string, fn: () => Promise<T>): Promise<T> {
+const memo = new Map<string, { t: number; v: Promise<unknown> }>();
+function cached<T>(key: string, fn: () => Promise<T>): Promise<T> {
   const hit = memo.get(key);
-  if (hit && Date.now() - hit.t < TTL) return hit.v as T;
-  const v = await fn();
+  if (hit && Date.now() - hit.t < TTL) return hit.v as Promise<T>;
+  const v = fn().catch(e => { memo.delete(key); throw e; });
   memo.set(key, { t: Date.now(), v });
   return v;
 }
@@ -143,13 +145,27 @@ export function more(out: Item[], nodes: Iterable<any>, limit: number, opts?: { 
 const secs = (d?: string) => (d ? d.split(':').reduce((a, b) => a * 60 + Number(b), 0) : 0);
 
 // ---- profile-aware filtering --------------------------------------------------
-export interface Dropped { blocked?: number; disliked?: number; served?: number; too_long?: number; subscribed?: number }
+export interface Dropped { blocked?: number; avoided?: number; disliked?: number; served?: number; too_long?: number; subscribed?: number }
 const norm = (s?: string) => (s ?? '').trim().replace(/^@/, '').toLowerCase();
-/** Drop what the local profile says not to show: blocked channels, disliked ids, recently served ids
+const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const has = (hay: string, w: string) => /^[\x00-\x7f]+$/.test(w)
+  ? new RegExp(`(^|[^a-z0-9])${esc(w)}(?=$|[^a-z0-9])`, 'i').test(hay)   // whole words for latin
+  : hay.toLowerCase().includes(w);                                        // no word breaks in CJK etc.
+/** True if a topic appears in the title/channel as a whole word/phrase, or every word of a multi-word topic does. */
+export function mentions(topic: string, i: Item): boolean {
+  const t = norm(topic);
+  if (!t) return false;
+  const hay = `${i.title} ${i.channel ?? ''}`;
+  if (has(hay, t)) return true;
+  const words = t.split(/\s+/).filter(w => w.length >= 3);
+  return words.length > 1 && words.every(w => has(hay, w));
+}
+/** Drop what the local profile says not to show: blocked channels, avoid topics, disliked ids, recently served ids
  *  (skip with served=false, e.g. for history), anything over prefs.max_duration_min. Counts what it dropped. */
 export function applyProfile(list: Item[], o: { served?: boolean } = {}): { items: Item[]; dropped?: Dropped } {
   const p = loadProfile();
   const blocked = new Set(p.blocked_channels.map(norm).filter(Boolean));
+  const avoid = p.avoid_topics.filter(t => norm(t));
   const disliked = new Set(p.feedback.filter(f => f.verdict === 'disliked').map(f => f.id));
   const served = new Set(o.served === false ? [] : p.served.slice(-60).map(s => s.id));
   const maxSecs = p.prefs.max_duration_min ? p.prefs.max_duration_min * 60 : 0;
@@ -157,12 +173,75 @@ export function applyProfile(list: Item[], o: { served?: boolean } = {}): { item
   const drop = (k: keyof Dropped) => { d[k] = (d[k] ?? 0) + 1; return false; };
   const kept = list.filter(i => {
     if (blocked.size && (blocked.has(norm(i.channel)) || blocked.has(norm(i.channelId)))) return drop('blocked');
+    if (avoid.some(t => mentions(t, i))) return drop('avoided');
     if (disliked.has(i.id)) return drop('disliked');
     if (served.has(i.id)) return drop('served');
     if (maxSecs && secs(i.duration) > maxSecs) return drop('too_long');
     return true;
   });
   return { items: kept, ...(Object.keys(d).length ? { dropped: d } : {}) };
+}
+
+// ---- explainable picks ----------------------------------------------------------
+/** Everything the list tools returned in this process, so profile_update can fill title/channel from an id. */
+const seen = new Map<string, Item>();
+export function remember<T extends Item>(list: T[]): T[] {
+  for (const i of list) { seen.delete(i.id); seen.set(i.id, i); }
+  while (seen.size > 2000) seen.delete(seen.keys().next().value as string);
+  return list;
+}
+export const recall = (id: string): { title?: string; channel?: string } | undefined => {
+  const i = seen.get(id);
+  return i ? { title: i.title, ...(i.channel ? { channel: i.channel } : {}) } : undefined;
+};
+/** The whole item behind an id (profile.reply fills title/channel/duration/views from it); undefined if no list tool returned it. */
+export const recallItem = (id: string): Item | undefined => seen.get(id);
+
+const chanKeys = (i: Item) => [norm(i.channelId), norm(i.channel)].filter(Boolean);
+
+/** Personal context behind the `why` tags: subscribed channels + the last 40 watched (channel counts, ids).
+ *  Fetched once per TTL when signed in; empty otherwise, so tags degrade to interests/feedback only. */
+export interface Ctx { signed_in: boolean; subs: Set<string>; hist: Map<string, number>; watched: Set<string> }
+export function context(): Promise<Ctx> {
+  if (!cookie()) return Promise.resolve({ signed_in: false, subs: subChannels, hist: new Map(), watched: new Set() });
+  return cached('ctx', async () => {
+    const none = { items: [] as Item[] };
+    const [s, h] = await Promise.all([
+      feed('subscriptions', { limit: 40 }).catch(() => none),
+      feed('history', { limit: 40 }).catch(() => none),
+    ]);
+    const hist = new Map<string, number>();
+    for (const i of h.items) for (const k of chanKeys(i)) hist.set(k, (hist.get(k) ?? 0) + 1);
+    return { signed_in: s.items.length > 0 || h.items.length > 0, subs: subChannels, hist, watched: new Set(h.items.map(i => i.id)) };
+  });
+}
+
+/** Machine tags saying why an item is (or is not) personal. The agent turns them into the per-pick "why" line. */
+export function tag(i: Item, p: Profile, c: Ctx): string[] {
+  const why: string[] = [];
+  const k = chanKeys(i);
+  const sub = k.some(x => c.subs.has(x));
+  const fav = p.favorite_channels.map(norm).some(f => k.includes(f));
+  const liked = p.feedback.filter(f => f.verdict === 'liked' && k.includes(norm(f.channel))).length;
+  const disliked = p.feedback.filter(f => f.verdict === 'disliked' && k.includes(norm(f.channel))).length;
+  const hist = Math.max(0, ...k.map(x => c.hist.get(x) ?? 0));
+  if (sub) why.push('subscribed');
+  if (fav) why.push('favorite_channel');
+  if (liked) why.push(`liked_channel:${liked}`);
+  if (disliked) why.push(`disliked_channel:${disliked}`);
+  if (hist) why.push(`history:${hist}`);
+  if (c.watched.has(i.id)) why.push('watched');
+  for (const t of p.interests) if (mentions(t, i)) why.push(`interest:${t}`);
+  if (c.signed_in && k.length && !sub && !fav && !liked && !hist) why.push('new_channel');
+  return why;
+}
+/** Attach `why` tags (and remember the items for recall). */
+export async function annotate<T extends Item>(list: T[]): Promise<T[]> {
+  remember(list);
+  if (!list.length) return list;
+  const p = loadProfile();
+  const c = await context();
+  return list.map(i => { const why = tag(i, p, c); return why.length ? { ...i, why } : i; });
 }
 
 // ---- operations --------------------------------------------------------------
