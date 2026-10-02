@@ -1,0 +1,6 @@
+node_modules/
+dist/
+cookie.txt
+*.log
+.env
+__pycache__/

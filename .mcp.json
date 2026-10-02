@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "tv": {
+      "command": "scripts/start.sh",
+      "args": [],
+      "env": {
+        "YT_BROWSER": "chrome:Profile 2",
+        "YT_LANG": "en",
+        "YT_LOCATION": "US"
+      }
+    }
+  }
+}
